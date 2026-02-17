@@ -41,7 +41,7 @@ def softplus_quantum(x, n_qubits, shots=10000):
     return circuit()
 
 # ============================================================================
-# ReLU – corrected conditional circuit (single CSWAP)
+# ReLU –  conditional circuit (single CSWAP)
 # ============================================================================
 def relu_circuit(sign_wire, data_wires, ancilla_wires):
     """Correct ReLU implementation using a single CSWAP per data qubit.
@@ -84,7 +84,7 @@ def relu_quantum(x, n_data_qubits, shots=10000):
             if (mag >> i) & 1:
                 qml.PauliX(wires=wires_data[i])
         # Ancilla start in |0⟩ automatically
-        # Apply corrected ReLU circuit
+        # Apply  ReLU circuit
         relu_circuit(wires_sign, wires_data, wires_ancilla)
         # Measure the data register – now contains ReLU(x)
         return qml.probs(wires=wires_data)
@@ -132,7 +132,7 @@ plt.ylabel('ζ(x)')
 plt.legend()
 plt.grid(True)
 plt.title('Softplus')
-# ---- ReLU (corrected with proper decoding) ----
+# ---- ReLU ( with proper decoding) ----
 n_data = 4   # 1 sign + 3 magnitude → range -8..7
 x_ints = np.arange(-8, 8)
 relu_quant = []
@@ -142,7 +142,7 @@ for x in x_ints:
 
 plt.subplot(1,2,2)
 plt.plot(x_ints, relu_classic, 'b-o', label='Exact ReLU')
-plt.plot(x_ints, relu_quant, 'r--s', label='Quantum (corrected circuit)')
+plt.plot(x_ints, relu_quant, 'r--s', label='Quantum ReLU (n=4, shots=1000)')
 plt.xlabel('x')
 plt.ylabel('ReLU(x)')
 plt.legend()
@@ -159,7 +159,7 @@ print("x\tExact\t⟨Z₀⟩")
 for i in range(0, len(x_neg), 10):
     print(f"{x_neg[i]:.2f}\t{soft_exact[i]:.6f}\t{soft_quant[i]:.6f}")
 
-print("\nReLU (corrected circuit):")
+print("\nReLU ( circuit):")
 print("x\tExact\tQuantum")
 for i, x in enumerate(x_ints):
     print(f"{x:2d}\t{relu_classic[i]:2d}\t{relu_quant[i]:2d}")
