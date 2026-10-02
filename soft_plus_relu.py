@@ -1,165 +1,137 @@
+"""
+Softplus via quadrature of the quantum sigmoid circuit + exact ReLU via CSWAP.
+
+Corrected softplus construction
+--------------------------------
+The product-state heuristic of the earlier draft is replaced by an exact
+identity: since d/dx softplus(x) = sigma(x),
+    softplus(x) = \\int_{-\\infty}^{x} sigma(t) dt .
+We evaluate sigma(t) with the exact single-qubit geometric circuit (sigmoid_tanh.py):
+sigma(x) = (1 + <Z_0>)/2 exactly, so the only per-node error is shot noise.
+at quadrature nodes on [-T, x] and integrate numerically (trapezoid).
+For x > 0 we use softplus(x) = x + softplus(-x).
+
+ReLU
+----
+For basis-encoded signed integers, one CSWAP per magnitude qubit, controlled
+by the sign qubit, swaps the data register with a |0> ancilla register when
+x < 0, leaving ReLU(x) = max(0, x) in the data register.
+"""
+
 import pennylane as qml
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ============================================================================
-# Softplus – approximate product state (as in the paper)
-# ============================================================================
-def softplus_circuit(x, n_qubits):
-    r"""Prepare the approximate state |ζ(x)⟩ given in the paper.
+np.random.seed(7)
 
-    For each qubit k, angle φ_k = 2 arcsin( exp(2^k x) / sqrt(2^(k+1)) ).
-    This state is claimed to approximate the softplus series for x<0.
-    """
+# --------------------------------------------------------------------------
+# Sigmoid via geometric-series circuit (same corrected construction)
+# --------------------------------------------------------------------------
+def geometric_state(r, n_qubits):
     for k in range(n_qubits):
-        arg = np.exp(2**k * x) / np.sqrt(2**(k+1))
-        # Clip to valid domain for arcsin (numerical safety)
-        if arg > 1.0:
-            arg = 1.0
-        if arg < -1.0:
-            arg = -1.0
-        phi = 2 * np.arcsin(arg)
-        qml.RY(phi, wires=k)
+        a = 0.5 * 2**k
+        theta = 2 * np.arcsin(r**a / np.sqrt(1 + r**(2 * a)))
+        qml.RY(theta, wires=k)
 
-def softplus_quantum(x, n_qubits, shots=10000):
-    """Return the expectation ⟨Z₀⟩ of the state prepared by softplus_circuit.
 
-    The paper does not specify how to extract the softplus value from the state;
-    here we simply measure Z on the first qubit for illustration.
-    """
-    if x >= 0:
-        # The series representation is only valid for x<0; for x≥0 we return NaN
-        return np.nan
-
+def sigmoid_quantum(x, n_qubits, shots):
+    if x < 0:
+        return 1.0 - sigmoid_quantum(-x, n_qubits, shots)
+    r = np.exp(-x)
     dev = qml.device('default.qubit', wires=n_qubits, shots=shots)
 
     @qml.qnode(dev)
     def circuit():
-        softplus_circuit(x, n_qubits)
+        geometric_state(r, n_qubits)
         return qml.expval(qml.PauliZ(0))
 
-    return circuit()
+    Z0 = circuit()
+    # exact single-qubit reduction: sigma(x) = (1 + <Z_0>)/2 (no truncation factor)
+    return 0.5 * (1.0 + Z0)
 
-# ============================================================================
-# ReLU –  conditional circuit (single CSWAP)
-# ============================================================================
-def relu_circuit(sign_wire, data_wires, ancilla_wires):
-    """Correct ReLU implementation using a single CSWAP per data qubit.
 
-    If sign_wire = 1 (negative input), swap each data qubit with its ancilla
-    (which is initially |0⟩), thereby setting the data register to zero.
-    If sign_wire = 0, data remains unchanged.
-    """
-    for d, a in zip(data_wires, ancilla_wires):
-        qml.CSWAP(wires=[sign_wire, d, a])
+def softplus_quantum(x, n_qubits, shots, T=8.0, n_nodes=120):
+    """softplus(x) for x < 0 by trapezoidal quadrature of quantum sigma."""
+    assert x < 0
+    grid = np.linspace(-T, x, n_nodes)
+    vals = np.array([sigmoid_quantum(t, n_qubits, shots) for t in grid])
+    return np.trapezoid(vals, grid)
 
-def relu_quantum(x, n_data_qubits, shots=10000):
-    """Simulate ReLU for a signed integer x with n_data_qubits bits (including sign).
 
-    The integer x must lie in the range [-2^(n_data_qubits-1), 2^(n_data_qubits-1)-1].
-    """
-    n_mag = n_data_qubits - 1                      # number of magnitude qubits
-    total_qubits = 1 + n_mag + n_mag                # sign + data + ancilla
+# --------------------------------------------------------------------------
+# ReLU via CSWAP
+# --------------------------------------------------------------------------
+def relu_quantum(x, n_mag, shots=1000):
+    """ReLU for signed integer x with n_mag magnitude bits."""
     wires_sign = 0
-    # Data qubits: we will encode them with qubit 1 as LSB, qubit 2 as next, etc.
-    # But PennyLane's probability ordering treats the first wire in the list as MSB.
-    # To avoid confusion, we keep the same order in encoding and decoding.
-    wires_data = list(range(1, 1 + n_mag))          # qubits 1..n_mag (qubit 1 = LSB)
+    wires_data = list(range(1, 1 + n_mag))
     wires_ancilla = list(range(1 + n_mag, 1 + 2 * n_mag))
+    total = 1 + 2 * n_mag
 
-    dev = qml.device('default.qubit', wires=total_qubits, shots=shots)
+    dev = qml.device('default.qubit', wires=total, shots=shots)
 
     @qml.qnode(dev)
     def circuit():
-        # Encode x in basis: sign qubit, data qubits for magnitude
-        sign = 0
         mag = x
         if x < 0:
-            sign = 1
-            mag = -x
-        if sign:
             qml.PauliX(wires=wires_sign)
-        # Encode magnitude in data qubits (binary, LSB in lowest-numbered qubit)
+            mag = -x
         for i in range(n_mag):
             if (mag >> i) & 1:
                 qml.PauliX(wires=wires_data[i])
-        # Ancilla start in |0⟩ automatically
-        # Apply  ReLU circuit
-        relu_circuit(wires_sign, wires_data, wires_ancilla)
-        # Measure the data register – now contains ReLU(x)
+        for d, a in zip(wires_data, wires_ancilla):
+            qml.CSWAP(wires=[wires_sign, d, a])
         return qml.probs(wires=wires_data)
 
     probs = circuit()
-    outcome = np.argmax(probs)   # most probable basis state
-
-    # Decode the outcome correctly: because wires_data are ordered [1,2,3] with qubit 1 as LSB,
-    # the index 'outcome' has qubit 1 as the most significant bit in its binary representation.
-    # We need to map bits back to their original weights.
+    outcome = int(np.argmax(probs))
     value = 0
     for i in range(n_mag):
-        # i = 0 corresponds to the least significant bit in our encoding (qubit 1)
-        # In the outcome, that bit is at position (n_mag-1-i)
         bit = (outcome >> (n_mag - 1 - i)) & 1
         value += bit * (2**i)
     return value
 
-# ============================================================================
-# Numerical experiments
-# ============================================================================
 
-# ---- Softplus ----
-n_soft = 5
-shots_soft = 5000
-x_neg = np.linspace(-5.0, -0.1, 50)
-soft_quant = []
-soft_exact = []
-for x in x_neg:
-    soft_quant.append(1-softplus_quantum(x, n_soft, shots_soft))
-    soft_exact.append(np.log(1 + np.exp(x)))
+if __name__ == "__main__":
+    n_qubits = 5
+    shots = 10000
 
-plt.figure(figsize=(15, 5))
-plt.rcParams.update({'font.size': 14})
-plt.rcParams['lines.linewidth'] = 2
-plt.rcParams['lines.markersize'] = 8
-plt.rcParams['axes.grid'] = True
-plt.rcParams['legend.fontsize'] = 14
-plt.rcParams['axes.labelsize'] = 14
-plt.subplot(1,2,1)
-plt.plot(x_neg, soft_exact, 'b-', label='Exact softplus')
-plt.plot(x_neg, soft_quant, 'r--', label=f'Quantum ⟨Z₀⟩ (n={n_soft}, shots={shots_soft})')
-plt.xlabel('x')
-plt.ylabel('ζ(x)')
-plt.legend()
-plt.grid(True)
-plt.title('Softplus')
-# ---- ReLU ( with proper decoding) ----
-n_data = 4   # 1 sign + 3 magnitude → range -8..7
-x_ints = np.arange(-8, 8)
-relu_quant = []
-relu_classic = [max(0, x) for x in x_ints]
-for x in x_ints:
-    relu_quant.append(relu_quantum(x, n_data, shots=1000))
+    # ---- Softplus ----
+    x_neg = np.linspace(-5.0, -0.25, 25)
+    soft_q = np.array([softplus_quantum(x, n_qubits, shots) for x in x_neg])
+    # extend to positive side via softplus(x) = x + softplus(-x)
+    soft_q_pos = -x_neg + soft_q[::-1] * 0  # placeholder, computed below
+    x_pos = -x_neg[::-1]
+    soft_q_pos = x_pos + soft_q[::-1]
+    x_all = np.concatenate([x_neg, x_pos])
+    soft_all = np.concatenate([soft_q, soft_q_pos])
+    soft_exact = np.log1p(np.exp(x_all))
 
-plt.subplot(1,2,2)
-plt.plot(x_ints, relu_classic, 'b-o', label='Exact ReLU')
-plt.plot(x_ints, relu_quant, 'r--s', label='Quantum ReLU (n=4, shots=1000)')
-plt.xlabel('x')
-plt.ylabel('ReLU(x)')
-plt.legend()
-plt.grid(True)
-plt.title('ReLU – single‑CSWAP circuit')
+    # ---- ReLU ----
+    n_mag = 3                      # 1 sign + 3 magnitude bits -> range -8..7
+    x_ints = np.arange(-8, 8)
+    relu_q = [relu_quantum(x, n_mag) for x in x_ints]
+    relu_exact = np.maximum(0, x_ints)
 
-plt.tight_layout()
-plt.savefig('softplus_relu_simulation.png', dpi=150)
-plt.show()
+    plt.figure(figsize=(14, 5))
+    plt.rcParams.update({'font.size': 13})
+    plt.rcParams['lines.linewidth'] = 2
+    plt.rcParams['axes.grid'] = True
 
-# Print values
-print("\nSoftplus (⟨Z₀⟩) – not equal to softplus:")
-print("x\tExact\t⟨Z₀⟩")
-for i in range(0, len(x_neg), 10):
-    print(f"{x_neg[i]:.2f}\t{soft_exact[i]:.6f}\t{soft_quant[i]:.6f}")
+    plt.subplot(1, 2, 1)
+    plt.plot(x_all, soft_exact, 'b-', label='Exact softplus')
+    plt.plot(x_all, soft_all, 'r--', label=f'Quantum quadrature (n={n_qubits}, {shots} shots/node)')
+    plt.xlabel('x'); plt.ylabel(r'$\zeta(x)$'); plt.legend()
+    plt.title('Softplus - quadrature of quantum sigmoid')
 
-print("\nReLU ( circuit):")
-print("x\tExact\tQuantum")
-for i, x in enumerate(x_ints):
-    print(f"{x:2d}\t{relu_classic[i]:2d}\t{relu_quant[i]:2d}")
+    plt.subplot(1, 2, 2)
+    plt.plot(x_ints, relu_exact, 'b-o', label='Exact ReLU')
+    plt.plot(x_ints, relu_q, 'r--s', label='Quantum ReLU (CSWAP)')
+    plt.xlabel('x'); plt.ylabel('ReLU(x)'); plt.legend()
+    plt.title('ReLU - conditional swap circuit')
+
+    plt.tight_layout()
+    plt.savefig('softplus_relu_simulation.png', dpi=150)
+
+    print("softplus max err:", np.max(np.abs(soft_all - soft_exact)))
+    print("relu exact match:", all(int(a) == int(b) for a, b in zip(relu_q, relu_exact)))

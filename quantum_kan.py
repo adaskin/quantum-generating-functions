@@ -6,8 +6,11 @@ All tensors use float32 for consistency.
 """
 
 import torch
+
+torch.manual_seed(42)
 import pennylane as qml
 import numpy as np
+np.random.seed(42)
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
@@ -27,7 +30,7 @@ class FourierTerm(torch.nn.Module):
         self.omega = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.dev = qml.device('default.qubit', wires=n_qubits + 1, shots=shots)
 
-        @qml.qnode(self.dev, interface='torch', diff_method='parameter-shift')
+        @qml.qnode(self.dev, interface='torch', diff_method='backprop')
         def circuit_real(phase):
             qml.Hadamard(wires=0)
             for k in range(1, self.n_qubits + 1):
@@ -38,7 +41,7 @@ class FourierTerm(torch.nn.Module):
             qml.Hadamard(wires=0)
             return qml.expval(qml.PauliZ(0))
 
-        @qml.qnode(self.dev, interface='torch', diff_method='parameter-shift')
+        @qml.qnode(self.dev, interface='torch', diff_method='backprop')
         def circuit_imag(phase):
             qml.Hadamard(wires=0)
             for k in range(1, self.n_qubits + 1):
@@ -167,70 +170,106 @@ def train_kan(model, X_train, y_train, X_val, y_val,
 
 
 # ----------------------------------------------------------------------
-# Main script
+# Main script: 3 seeds + classical Fourier twin baseline
 # ----------------------------------------------------------------------
-# if __name__ == "__main__":
-# Generate dataset: y = sin(x) on [0, π]
+# Generate dataset: y = sin(x) on [0, pi]
 X = torch.linspace(0, np.pi, 500).reshape(-1, 1).float()
 y = torch.sin(X).float()
 
-# Normalise (helps training)
 X_mean, X_std = X.mean(), X.std()
 y_mean, y_std = y.mean(), y.std()
-X_norm = (X - X_mean) / X_std
-y_norm = (y - y_mean) / y_std
+X_norm = ((X - X_mean) / X_std).float()
+y_norm = ((y - y_mean) / y_std).float()
 
-# Convert to float32 (already)
-X_norm = X_norm.float()
-y_norm = y_norm.float()
 
-# Train/val/test split (70/15/15)
-X_train, X_temp, y_train, y_temp = train_test_split(X_norm, y_norm, test_size=0.3, random_state=42)
-X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+class ClassicalFourierTwin(torch.nn.Module):
+    """Classical analogue of the quantum model: the same real Dirichlet-kernel
+    terms D(omega x) = Re[(1/N) sum_j e^{i omega x j}] with learnable
+    frequencies and weights, evaluated in closed form (no quantum circuit)."""
+    def __init__(self, n_terms=4, n_qubits=5):
+        super().__init__()
+        self.N = 2 ** n_qubits
+        self.omegas = torch.nn.Parameter(torch.ones(n_terms, dtype=torch.float32))
+        self.weights = torch.nn.Parameter(torch.randn(n_terms, dtype=torch.float32) * 0.1)
+        self.bias = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
-# Use MultiFourierEncoding with 4 terms
-fn_constructor = lambda: MultiFourierEncoding(n_terms=4, n_qubits=5, shots=None)
+    def forward(self, x):
+        j = torch.arange(self.N, dtype=torch.float32)
+        outs = []
+        for om in self.omegas:
+            ph = om * x.squeeze(-1)                     # (batch,)
+            D = torch.cos(torch.outer(ph, j)).mean(dim=1)  # Re Dirichlet kernel
+            outs.append(D)
+        return (torch.stack(outs, dim=1) @ self.weights + self.bias).unsqueeze(-1)
 
-model = QuantumKANLayer(n_inputs=1, n_outputs=1,
-                        univariate_fn_constructor=fn_constructor,
-                        activation=torch.nn.Identity())
 
-# Train
-train_losses, val_losses = train_kan(model, X_train, y_train, X_val, y_val,
-                                        epochs=50, lr=0.05, batch_size=32)
+def run_quantum(seed):
+    torch.manual_seed(seed); np.random.seed(seed)
+    X_tr, X_tmp, y_tr, y_tmp = train_test_split(X_norm, y_norm, test_size=0.3, random_state=42)
+    X_v, X_te, y_v, y_te = train_test_split(X_tmp, y_tmp, test_size=0.5, random_state=42)
+    fn_constructor = lambda: MultiFourierEncoding(n_terms=4, n_qubits=5, shots=None)
+    model = QuantumKANLayer(1, 1, fn_constructor, activation=torch.nn.Identity())
+    tr_l, val_l = train_kan(model, X_tr, y_tr, X_v, y_v, epochs=50, lr=0.05,
+                            batch_size=32, verbose=(seed == 42))
+    model.eval()
+    with torch.no_grad():
+        y_pred = model(X_te) * y_std + y_mean
+        y_true = y_te * y_std + y_mean
+        mse = torch.nn.functional.mse_loss(y_pred, y_true).item()
+    omegas = [tm.omega.item() for tm in model.fns[0][0].terms]
+    return dict(mse=mse, omegas=omegas, tr=tr_l, val=val_l,
+                X_te=X_te, y_true=y_true, y_pred=y_pred)
 
-# Evaluate on test set
-model.eval()
-with torch.no_grad():
-    y_test_pred_norm = model(X_test)
-    y_test_pred = y_test_pred_norm * y_std + y_mean
-    y_test_true = y_test * y_std + y_mean
-    test_mse = torch.nn.functional.mse_loss(y_test_pred, y_test_true)
-    print(f"\nTest MSE (denormalized): {test_mse.item():.6f}")
 
-plt.figure(figsize=(15, 5))
-plt.rcParams.update({'font.size': 14})
-plt.rcParams['lines.linewidth'] = 2
-plt.rcParams['lines.markersize'] = 8
-plt.rcParams['axes.grid'] = True
-plt.rcParams['legend.fontsize'] = 14
-plt.rcParams['axes.labelsize'] = 14
-plt.subplot(1,2,1)
-plt.plot(train_losses, label='Train')
-plt.plot(val_losses, label='Val')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.title('Training Curve')
+def run_classical(seed=42):
+    torch.manual_seed(seed); np.random.seed(seed)
+    X_tr, X_tmp, y_tr, y_tmp = train_test_split(X_norm, y_norm, test_size=0.3, random_state=42)
+    X_v, X_te, y_v, y_te = train_test_split(X_tmp, y_tmp, test_size=0.5, random_state=42)
+    model = ClassicalFourierTwin(n_terms=4, n_qubits=5)
+    tr_l, val_l = train_kan(model, X_tr, y_tr, X_v, y_v, epochs=50, lr=0.05,
+                            batch_size=32, verbose=False)
+    model.eval()
+    with torch.no_grad():
+        y_pred = model(X_te) * y_std + y_mean
+        y_true = y_te * y_std + y_mean
+        mse = torch.nn.functional.mse_loss(y_pred, y_true).item()
+    return dict(mse=mse, X_te=X_te, y_true=y_true, y_pred=y_pred)
 
-plt.subplot(1,2,2)
-sort_idx = X_test.squeeze().argsort()
-plt.plot(X_test[sort_idx].numpy(), y_test_true[sort_idx].numpy(), 'o', label='True')
-plt.plot(X_test[sort_idx].numpy(), y_test_pred[sort_idx].numpy(), 'x', label='Predicted')
-plt.xlabel('x (normalized)')
-plt.ylabel('y')
-plt.legend()
-plt.title('Quantum KAN Approximation (Multi‑Fourier)')
-plt.tight_layout()
-plt.savefig('quantum_kan_multi_fourier.png')
-plt.show()
+
+if __name__ == "__main__":
+    results = [run_quantum(s) for s in [42, 43, 44]]
+    mses = np.array([r['mse'] for r in results])
+    print("\nQuantum KAN test MSE (denormalized) over seeds 42-44: "
+          f"{mses.mean():.6f} +/- {mses.std():.6f}  {np.round(mses,6).tolist()}")
+    print("learned omegas (seed 42):", np.round(results[0]['omegas'], 3))
+
+    cls = [run_classical(s) for s in [42, 43, 44]]
+    cl = cls[0]
+    cmses = np.array([c['mse'] for c in cls])
+    print(f"Classical Fourier twin test MSE (denormalized) over seeds 42-44: "
+          f"{cmses.mean():.6f} +/- {cmses.std():.6f}")
+
+    r0 = results[0]
+    plt.figure(figsize=(15, 5))
+    plt.rcParams.update({'font.size': 14})
+    plt.rcParams['lines.linewidth'] = 2
+    plt.rcParams['lines.markersize'] = 7
+    plt.rcParams['axes.grid'] = True
+    plt.subplot(1, 2, 1)
+    plt.plot(r0['tr'], label='Train')
+    plt.plot(r0['val'], label='Val')
+    plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend()
+    plt.title('Training Curve (seed 42, statevector, no shot noise)')
+
+    plt.subplot(1, 2, 2)
+    si = r0['X_te'].squeeze().argsort()
+    plt.plot(r0['X_te'][si].numpy(), r0['y_true'][si].numpy(), 'o', label='True')
+    plt.plot(r0['X_te'][si].numpy(), r0['y_pred'][si].numpy(), 'x',
+             label=f'Quantum KAN (MSE {mses.mean():.1e}$\\pm${mses.std():.0e})')
+    sic = cl['X_te'].squeeze().argsort()
+    plt.plot(cl['X_te'][sic].numpy(), cl['y_pred'][sic].numpy(), '^', ms=5,
+             label=f'Classical Fourier twin (MSE {cmses.mean():.1e})')
+    plt.xlabel('x (normalized)'); plt.ylabel('y'); plt.legend(fontsize=11)
+    plt.title('Quantum KAN vs classical Fourier twin')
+    plt.tight_layout()
+    plt.savefig('quantum_kan_multi_fourier.png')
