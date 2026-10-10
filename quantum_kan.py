@@ -41,30 +41,13 @@ class FourierTerm(torch.nn.Module):
             qml.Hadamard(wires=0)
             return qml.expval(qml.PauliZ(0))
 
-        @qml.qnode(self.dev, interface='torch', diff_method='backprop')
-        def circuit_imag(phase):
-            qml.Hadamard(wires=0)
-            for k in range(1, self.n_qubits + 1):
-                qml.Hadamard(wires=k)
-            for k in range(self.n_qubits):
-                angle = phase * (2 ** k)
-                qml.ControlledPhaseShift(angle, wires=[0, k + 1])
-            qml.adjoint(qml.S)(wires=0)
-            qml.Hadamard(wires=0)
-            return qml.expval(qml.PauliZ(0))
-
         self.circuit_real = circuit_real
-        self.circuit_imag = circuit_imag
 
     def forward(self, x):
-        results = []
-        for xi in x:
-            phase = self.omega * xi
-            re = self.circuit_real(phase)
-            im = self.circuit_imag(phase)
-            avg = re + 1j * im
-            results.append(avg.real.float())   # ensure float32
-        return torch.stack(results)
+        # Hadamard test: <Z_0> = Re[(1/N) sum_j e^{i omega x j}] (real Dirichlet kernel).
+        # The whole batch is evaluated at once via PennyLane parameter broadcasting.
+        phase = self.omega * x
+        return self.circuit_real(phase).float()   # ensure float32
 
 
 # ----------------------------------------------------------------------

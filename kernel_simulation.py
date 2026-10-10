@@ -15,7 +15,9 @@ give |<phi(x)|phi(y)>|^2 = [sqrt((1-qx^2)(1-qy^2)) + qx qy]^{2d}
 Estimated by SWAP test on 2d+1 qubits.
 
 Panel (c): Kernel ridge regression with the quantum geometric kernel
-(SWAP-test kernel matrix) on a 1-D binary classification task.
+(Gram matrix and test kernel both with SWAP-test shot noise, simulated by the
+equivalent binomial sampling) on a 1-D binary classification task. Training
+labels carry 10% flip noise; test labels are noise-free.
 """
 
 import pennylane as qml
@@ -120,9 +122,8 @@ if __name__ == "__main__":
         p = np.clip((1 + K_exact) / 2, 0, 1)
         return 2 * rng.binomial(M, p) / M - 1
 
-    def ridge_acc(Kmat_tr, ytr, Xtr_k, Xte_k, kern_exact):
+    def ridge_acc(Kmat_tr, ytr, Kte):
         alpha = np.linalg.solve(Kmat_tr + lam * np.eye(len(ytr)), ytr)
-        Kte = np.array([[kern_exact(xt, xs) for xs in Xtr_k] for xt in Xte_k])
         return np.sign(Kte @ alpha)
 
     gamma_rbf = 2.0
@@ -131,7 +132,8 @@ if __name__ == "__main__":
     Xte_n = 0.9 * Xte / np.pi
     geo_exact_tr = np.array([[geo_kernel_exact(a, b, n_qubits) for b in Xn] for a in Xn])
     rbf_tr = np.exp(-gamma_rbf**2 * (Xtr[:, None] - Xtr[None, :])**2)
-    rbf_te = lambda xt, xs: np.exp(-gamma_rbf**2 * (xt - xs)**2)
+    rbf_te_mat = np.exp(-gamma_rbf**2 * (Xte[:, None] - Xtr[None, :])**2)
+    geo_exact_te = np.array([[geo_kernel_exact(a, b, n_qubits) for b in Xn] for a in Xte_n])
 
     n_seeds = 10
     acc_q, acc_rbf = [], []
@@ -139,10 +141,13 @@ if __name__ == "__main__":
     for seed in range(n_seeds):
         rng = np.random.default_rng(seed)
         ytr = np.sign(np.sin(3 * Xtr)); flip = rng.random(n_train) < 0.1; ytr[flip] *= -1
+        # Gram matrix AND test-train kernel are both estimated with shot noise
         Kq = swap_noise(geo_exact_tr, shots, rng)
+        Kq = np.triu(Kq) + np.triu(Kq, 1).T      # symmetric estimate
         np.fill_diagonal(Kq, 1.0)  # SWAP test of a state with itself is exactly 1
-        pq = ridge_acc(Kq, ytr, Xn, Xte_n, lambda xt, xs: geo_kernel_exact(xt, xs, n_qubits))
-        pr = ridge_acc(rbf_tr, ytr, Xtr, Xte, rbf_te)
+        Kq_te = swap_noise(geo_exact_te, shots, rng)
+        pq = ridge_acc(Kq, ytr, Kq_te)
+        pr = ridge_acc(rbf_tr, ytr, rbf_te_mat)
         acc_q.append(np.mean(pq == yte)); acc_rbf.append(np.mean(pr == yte))
         if seed == 0:
             preds = {'q': pq, 'rbf': pr, 'ytr': ytr}

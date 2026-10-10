@@ -13,7 +13,8 @@ For x > 0 we use softplus(x) = x + softplus(-x).
 
 ReLU
 ----
-For basis-encoded signed integers, one CSWAP per magnitude qubit, controlled
+For basis-encoded signed integers in sign-magnitude form (3 magnitude bits
+represent -7..7), one CSWAP per magnitude qubit, controlled
 by the sign qubit, swaps the data register with a |0> ancilla register when
 x < 0, leaving ReLU(x) = max(0, x) in the data register.
 """
@@ -108,8 +109,8 @@ if __name__ == "__main__":
     soft_exact = np.log1p(np.exp(x_all))
 
     # ---- ReLU ----
-    n_mag = 3                      # 1 sign + 3 magnitude bits -> range -8..7
-    x_ints = np.arange(-8, 8)
+    n_mag = 3                      # sign-magnitude: 1 sign + 3 magnitude bits -> range -7..7
+    x_ints = np.arange(-7, 8)
     relu_q = [relu_quantum(x, n_mag) for x in x_ints]
     relu_exact = np.maximum(0, x_ints)
 
